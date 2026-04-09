@@ -5,52 +5,58 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <PubSubClient.h>
 
 // ================= OLED =================
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ================= RESET =================
-#define RESET_PIN D3
-#define RESET_HOLD_TIME_MS 2000
-
-// ================= EEPROM =================
-#define EEPROM_SIZE 256
-#define SSID_ADDR 0
-#define PASS_ADDR 64
-#define DEVICE_ID_ADDR 128
-
-// ================= WIFI =================
-#define MAX_WIFI_CONNECT_ATTEMPTS 40
-
+// ================= SERVER =================
 ESP8266WebServer server(80);
 DNSServer dns;
 
-// ================= GLOBAL =================
-String ssid, pass;
-String deviceID;
-String apSSID, apPASS;
-
-// ================= UTIL =================
-String randomPrefix() {
-  const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  String result = "";
-  for (int i = 0; i < 3; i++) result += charset[random(0, 36)];
-  return result;
-}
-
-String randomAPPass() {
-  String password = "";
-  for (int i = 0; i < 8; i++) password += String(random(0, 10));
-  return password;
-}
-
-String generateAPSSID() {
-  return "ESP-" + randomPrefix() + String(random(100, 999));
-}
-
 // ================= EEPROM =================
+#define EEPROM_SIZE 512
+
+#define SSID_ADDR 0
+#define PASS_ADDR 64
+#define MQTT_HOST_ADDR 128
+#define MQTT_PORT_ADDR 192
+#define MQTT_USER_ADDR 224
+#define MQTT_PASS_ADDR 288
+
+// ================= WIFI =================
+String ssid = "";
+String pass = "";
+
+// ================= MQTT =================
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+String mqttHost = "";
+int mqttPort = 1883;
+String mqttUser = "";
+String mqttPass = "";
+String mqttClientID;
+
+bool mqttConnected = false;
+
+// ================= OLED =================
+void oled(String l1, String l2, String l3, String l4) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  display.setCursor(0, 0);  display.println(l1);
+  display.setCursor(0, 16); display.println(l2);
+  display.setCursor(0, 32); display.println(l3);
+  display.setCursor(0, 48); display.println(l4);
+
+  display.display();
+}
+
+// ================= EEPROM HELPERS =================
 void saveString(int addr, String data) {
   for (int i = 0; i < 64; i++) EEPROM.write(addr + i, 0);
   for (int i = 0; i < data.length(); i++) EEPROM.write(addr + i, data[i]);
@@ -58,246 +64,249 @@ void saveString(int addr, String data) {
 }
 
 String readString(int addr) {
-  String result = "";
+  String s = "";
   for (int i = 0; i < 64; i++) {
     char c = EEPROM.read(addr + i);
-    if (c == 0 || c == 255) break;
-    result += c;
+    if (c == 0) break;
+    s += c;
   }
-  return result;
+  return s;
 }
 
-// ================= DEVICE ID =================
-void loadOrCreateDeviceID() {
-  deviceID = readString(DEVICE_ID_ADDR);
+// ================= MQTT CONNECT =================
+void connectMQTT() {
 
-  if (deviceID.length() < 5) {
-    String chip = String(ESP.getChipId(), HEX);
-    chip.toUpperCase();
-    deviceID = randomPrefix() + "-" + chip;
-    saveString(DEVICE_ID_ADDR, deviceID);
-  }
-}
+  if (mqttHost == "") return;
 
-// ================= OLED =================
-void showLoading() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
+  mqtt.setServer(mqttHost.c_str(), mqttPort);
 
-  display.setCursor(10, 28);
-  display.println("Initializing Device");
+  mqttClientID = "ESP-" + String(ESP.getChipId());
 
-  display.display();
-}
-
-void showSetup(IPAddress ip) {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-
-  display.setCursor(0, 0);
-  display.println("SETUP MODE");
-
-  display.setCursor(0, 18);
-  display.print("SSID: ");
-  display.print(apSSID);
-
-  display.setCursor(0, 32);
-  display.print("PASS: ");
-  display.print(apPASS);
-
-  display.setCursor(0, 50);
-  display.print("IP: ");
-  display.print(ip);
-
-  display.display();
-}
-
-void showOnline() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-
-  display.setCursor(0, 0);
-  display.println("ONLINE");
-
-  display.setCursor(0, 25);
-  display.print("ID: ");
-  display.print(deviceID);
-
-  display.setCursor(0, 45);
-  display.print("IP: ");
-  display.print(WiFi.localIP());
-
-  display.display();
-}
-
-// ================= RESET =================
-void factoryReset() {
-  for (int i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, 0);
-  EEPROM.commit();
-
-  WiFi.disconnect(true);
-  WiFi.softAPdisconnect(true);
-
-  delay(500);
-  ESP.restart();
-}
-
-void checkReset() {
-  if (digitalRead(RESET_PIN) == LOW) {
-    delay(RESET_HOLD_TIME_MS);
-    if (digitalRead(RESET_PIN) == LOW) {
-      factoryReset();
-    }
+  if (mqtt.connect(mqttClientID.c_str(), mqttUser.c_str(), mqttPass.c_str())) {
+    mqttConnected = true;
+  } else {
+    mqttConnected = false;
   }
 }
 
 // ================= WIFI CONNECT =================
 bool connectWiFi() {
 
-  if (ssid.length() == 0 || pass.length() == 0) return false;
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), pass.c_str());
 
-  showLoading();
+  oled("CONNECTING WIFI", ssid, "", "");
 
-  int attempts = 0;
-
-  while (attempts < MAX_WIFI_CONNECT_ATTEMPTS) {
-    if (WiFi.status() == WL_CONNECTED) return true;
+  int t = 0;
+  while (WiFi.status() != WL_CONNECTED && t < 40) {
     delay(500);
-    attempts++;
+    t++;
   }
 
-  return false;
+  return WiFi.status() == WL_CONNECTED;
 }
 
-// ================= AP MODE =================
-void startAP() {
+// ================= SAVE MQTT =================
+void saveMQTT() {
 
-  randomSeed(micros());
+  mqttHost = server.arg("host");
+  mqttPort = server.arg("port").toInt();
+  mqttUser = server.arg("user");
+  mqttPass = server.arg("pass");
 
-  apSSID = generateAPSSID();
-  apPASS = randomAPPass();
+  saveString(MQTT_HOST_ADDR, mqttHost);
+  saveString(MQTT_PORT_ADDR, String(mqttPort));
+  saveString(MQTT_USER_ADDR, mqttUser);
+  saveString(MQTT_PASS_ADDR, mqttPass);
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(apSSID.c_str(), apPASS.c_str());
+  connectMQTT();
 
-  IPAddress ip = WiFi.softAPIP();
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
+}
 
-  dns.start(53, "*", ip);
+// ================= RESET =================
+void handleReset() {
 
-  server.on("/", []() {
-    String html =
-      "<h2>ESP Setup</h2>"
-      "<p><b>SSID:</b> " + apSSID + "</p>"
-      "<p><b>PASS:</b> " + apPASS + "</p>"
-      "<p><b>IP:</b> " + WiFi.softAPIP().toString() + "</p>"
-      "<a href='/scan'>Configure WiFi</a>";
-    server.send(200, "text/html", html);
-  });
+  for (int i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, 0);
+  EEPROM.commit();
 
-  server.on("/scan", []() {
-    int networkCount = WiFi.scanNetworks();
+  server.send(200, "text/html", "RESET DONE. REBOOTING...");
+  delay(1000);
+  ESP.restart();
+}
 
-    String html = "<form method='POST' action='/connect'>";
+// ================= MQTT UI =================
+void handleRoot() {
 
-    for (int i = 0; i < networkCount; i++) {
-      html += "<input type='radio' name='ssid' value='" + WiFi.SSID(i) + "'>";
-      html += WiFi.SSID(i) + "<br>";
-    }
+  String statusColor = mqttConnected ? "#00c853" : "#d50000";
+  String statusText = mqttConnected ? "CONNECTED" : "DISCONNECTED";
 
-    html += "<input type='password' name='pass' placeholder='Password' required><br>";
-    html += "<button type='submit'>Connect</button></form>";
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQTT PANEL</title>
 
-    server.send(200, "text/html", html);
-  });
+<style>
+body {
+  font-family: Arial;
+  background: #0f172a;
+  color: white;
+  text-align: center;
+  padding: 20px;
+}
 
-  server.on("/connect", HTTP_POST, []() {
+.card {
+  background: #1e293b;
+  padding: 20px;
+  border-radius: 15px;
+  max-width: 360px;
+  margin: auto;
+}
 
-    String newSSID = server.arg("ssid");
-    String newPASS = server.arg("pass");
+input {
+  width: 90%;
+  padding: 10px;
+  margin: 6px;
+  border-radius: 8px;
+  border: none;
+}
 
-    WiFi.disconnect();
-    delay(300);
+button {
+  width: 95%;
+  padding: 10px;
+  margin-top: 10px;
+  border: none;
+  border-radius: 8px;
+  font-weight: bold;
+}
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(newSSID.c_str(), newPASS.c_str());
+.save { background: #3b82f6; color: white; }
+.reset { background: #ef4444; color: white; }
 
-    showLoading();
+.status {
+  padding: 10px;
+  border-radius: 8px;
+  margin-bottom: 10px;
+  font-weight: bold;
+}
+</style>
+</head>
 
-    int attempts = 0;
-    bool connected = false;
+<body>
 
-    while (attempts < MAX_WIFI_CONNECT_ATTEMPTS) {
-      if (WiFi.status() == WL_CONNECTED) {
-        connected = true;
-        break;
-      }
-      delay(500);
-      attempts++;
-    }
+<div class="card">
+<h2>MQTT CONFIG</h2>
 
-    if (connected) {
-      saveString(SSID_ADDR, newSSID);
-      saveString(PASS_ADDR, newPASS);
+<div class="status" style="background:)rawliteral" + statusColor + R"rawliteral(">
+)rawliteral" + statusText + R"rawliteral(
+</div>
+)rawliteral";
 
-      server.send(200, "text/html",
-        "<h2>Connected</h2><p>Rebooting...</p>");
+  if (!mqttConnected) {
+    html += R"rawliteral(
+<form method='POST' action='/mqtt'>
+<input name='host' placeholder='MQTT Host'>
+<input name='port' placeholder='Port'>
+<input name='user' placeholder='Username'>
+<input name='pass' type='password' placeholder='Password'>
+<button class='save'>CONNECT</button>
+</form>
+)rawliteral";
+  }
 
-      delay(1500);
-      ESP.restart();
-    } else {
-      WiFi.disconnect(true);
+  html += R"rawliteral(
+<form method='POST' action='/reset'>
+<button class='reset'>RESET DEVICE</button>
+</form>
 
-      server.send(200, "text/html",
-        "<h2 style='color:red;'>Wrong Password</h2><a href='/scan'>Try Again</a>");
+</div>
+</body>
+</html>
+)rawliteral";
 
-      startAP();
-    }
-  });
+  server.send(200, "text/html", html);
+}
 
-  server.begin();
+// ================= LOAD MQTT =================
+void loadMQTT() {
 
-  showSetup(ip);
+  mqttHost = readString(MQTT_HOST_ADDR);
+  mqttPort = readString(MQTT_PORT_ADDR).toInt();
+  mqttUser = readString(MQTT_USER_ADDR);
+  mqttPass = readString(MQTT_PASS_ADDR);
 }
 
 // ================= SETUP =================
 void setup() {
+
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
 
-  pinMode(RESET_PIN, INPUT_PULLUP);
-
   Wire.begin(D2, D1);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
-  showLoading();
-  delay(1200);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    while (true);
+  }
+
+  oled("BOOTING", "ESP DEVICE", "", "");
 
   ssid = readString(SSID_ADDR);
   pass = readString(PASS_ADDR);
 
-  loadOrCreateDeviceID();
+  loadMQTT();
 
-  bool connected = connectWiFi();
+  if (ssid.length() > 0 && connectWiFi()) {
 
-  if (!connected) {
-    startAP();
+    server.on("/", handleRoot);
+    server.on("/mqtt", HTTP_POST, saveMQTT);
+    server.on("/reset", HTTP_POST, handleReset);
+
+    server.begin();
+
+    connectMQTT();
+
+    oled("ONLINE",
+         WiFi.localIP().toString(),
+         mqttConnected ? "MQTT ONLINE" : "MQTT OFFLINE",
+         "");
+
+  } else {
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP-SETUP", "12345678");
+
+    oled("SETUP MODE", "ESP-SETUP", WiFi.softAPIP().toString(), "");
+
+    server.on("/", handleRoot);
+    server.on("/mqtt", HTTP_POST, saveMQTT);
+    server.on("/reset", HTTP_POST, handleReset);
+
+    server.begin();
   }
 }
 
 // ================= LOOP =================
 void loop() {
-  checkReset();
 
-  dns.processNextRequest();
   server.handleClient();
 
   if (WiFi.status() == WL_CONNECTED) {
-    showOnline();
+
+    if (!mqtt.connected()) {
+      connectMQTT();
+    }
+
+    mqtt.loop();
+    mqttConnected = mqtt.connected();
+
+    oled(
+      "ONLINE",
+      WiFi.localIP().toString(),
+      mqttConnected ? "MQTT ONLINE" : "MQTT OFFLINE",
+      "RUNNING"
+    );
   }
 }
