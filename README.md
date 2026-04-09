@@ -1,16 +1,18 @@
 # esp_wifi_setup
 
-An ESP8266-based WiFi provisioning system with OLED display support, captive portal for wireless configuration, persistent credential storage via EEPROM, and a factory reset function.
+An ESP8266 firmware that connects to a saved WiFi network, then runs a web panel to configure and connect to an MQTT broker. An SSD1306 OLED display shows live status. All credentials are persisted to EEPROM.
 
 ---
 
 ## Features
 
-- **Captive Portal AP Mode** – Automatically creates a unique access point when no WiFi credentials are saved, allowing users to configure the network via a browser.
-- **Persistent EEPROM Storage** – Saves WiFi SSID, password, and a unique device ID to EEPROM so credentials survive power cycles.
-- **OLED Display (SSD1306)** – Shows status information including AP credentials, device ID, and local IP address.
-- **Unique Device ID** – Generates and stores a human-readable device ID derived from the ESP8266 chip ID on first boot.
-- **Factory Reset** – Hold the reset button (D3) for 2 seconds to erase all stored credentials and restart the device.
+- **WiFi Connection** – Reads SSID and password from EEPROM on boot and connects automatically.
+- **AP / Setup Mode** – If no WiFi credentials are stored (or the connection fails), starts a fixed access point (`ESP-SETUP` / `12345678`) so the device is still reachable.
+- **MQTT Client** – Connects to a configurable MQTT broker; automatically reconnects in the main loop.
+- **MQTT Config Panel** – A browser-based UI (served from the device) lets you enter broker host, port, username, and password.
+- **Persistent EEPROM Storage** – WiFi and MQTT credentials survive power cycles (512-byte EEPROM).
+- **OLED Display (SSD1306)** – Shows boot, connecting, online/offline, and MQTT status on a 128×64 display.
+- **Web Reset** – A button in the web panel wipes all EEPROM data and reboots the device.
 
 ---
 
@@ -20,7 +22,6 @@ An ESP8266-based WiFi provisioning system with OLED display support, captive por
 |---|---|
 | Board | ESP8266 (NodeMCU / Wemos D1 Mini or compatible) |
 | Display | 0.96" SSD1306 OLED (I2C, 128×64) |
-| Reset Button | Momentary push button connected to pin **D3** (active LOW) |
 
 ### Wiring
 
@@ -31,11 +32,6 @@ An ESP8266-based WiFi provisioning system with OLED display support, captive por
 | VCC | 3.3V |
 | GND | GND |
 
-| Button Pin | ESP8266 Pin |
-|---|---|
-| One leg | D3 |
-| Other leg | GND |
-
 ---
 
 ## Dependencies / Libraries
@@ -45,12 +41,13 @@ Install the following libraries via the Arduino Library Manager:
 | Library | Purpose |
 |---|---|
 | `ESP8266WiFi` | WiFi connectivity (bundled with ESP8266 core) |
-| `ESP8266WebServer` | Web server for captive portal (bundled with ESP8266 core) |
-| `DNSServer` | DNS redirection for captive portal (bundled with ESP8266 core) |
+| `ESP8266WebServer` | Web server for the config panel (bundled with ESP8266 core) |
+| `DNSServer` | DNS server support (bundled with ESP8266 core) |
 | `EEPROM` | Credential persistence (bundled with ESP8266 core) |
 | `Wire` | I2C communication (bundled with Arduino core) |
 | `Adafruit GFX Library` | Graphics primitives for OLED |
 | `Adafruit SSD1306` | SSD1306 OLED driver |
+| `PubSubClient` | MQTT client |
 
 ---
 
@@ -78,33 +75,51 @@ Install the following libraries via the Arduino Library Manager:
 Power On
    │
    ▼
-Read SSID & Password from EEPROM
+Read WiFi SSID & Password from EEPROM
    │
-   ├─ Credentials found ──► Connect to WiFi
+   ├─ Credentials found ──► Connect to WiFi (20-second timeout)
    │                              │
-   │                         Connected? ──Yes──► Show "ONLINE" on OLED
-   │                              │
+   │                         Connected? ──Yes──► Load MQTT creds → Connect MQTT
+   │                              │                    │
+   │                              │              Show "ONLINE" + IP + MQTT status
    │                             No
    │                              │
    └─ No credentials ────────────►▼
-                            Start AP Mode (Captive Portal)
-                            Show AP SSID / PASS / IP on OLED
+                            Start AP Mode
+                            SSID: ESP-SETUP  Password: 12345678
+                            Show "SETUP MODE" on OLED
 ```
 
 ### AP / Setup Mode
 
-1. The device creates an access point with a randomly generated SSID (e.g. `ESP-XYZ123`) and an 8-digit numeric password.
-2. Connect to that AP from any phone or computer.
-3. A captive portal page will open automatically (or navigate to `192.168.4.1`).
-4. Click **Configure WiFi** to scan for nearby networks.
-5. Select your network, enter the password, and submit.
-6. The device connects to your network, saves the credentials, and reboots.
+When no WiFi credentials are stored or the connection fails, the device starts an access point:
 
-### Factory Reset
+- **SSID:** `ESP-SETUP`
+- **Password:** `12345678`
+- **IP:** `192.168.4.1`
 
-- Hold the button on pin **D3** for **2 seconds**.
-- All EEPROM data (SSID, password, device ID) is erased.
-- The device restarts and enters AP mode again.
+Connect to the AP from any phone or computer and open `192.168.4.1` to reach the MQTT config panel.
+
+> WiFi credentials (SSID / password) must be written directly to EEPROM addresses 0 and 64 before the device can join a network.
+
+### MQTT Configuration
+
+1. Open the web panel at the device IP (connected mode) or `192.168.4.1` (AP mode).
+2. Fill in **MQTT Host**, **Port**, **Username**, and **Password**.
+3. Click **CONNECT** – the device saves the credentials and attempts to connect immediately.
+4. The panel shows **CONNECTED** (green) or **DISCONNECTED** (red).
+
+### Main Loop
+
+- Handles incoming HTTP requests.
+- If WiFi is connected, checks the MQTT connection and reconnects if needed.
+- Updates the OLED every loop iteration with current online/MQTT status.
+
+### Factory Reset (Web)
+
+- Open the web panel and click **RESET DEVICE**.
+- All 512 bytes of EEPROM are erased.
+- The device reboots and enters AP mode.
 
 ---
 
@@ -114,7 +129,12 @@ Read SSID & Password from EEPROM
 |---|---|---|
 | 0 | 64 bytes | WiFi SSID |
 | 64 | 64 bytes | WiFi Password |
-| 128 | 64 bytes | Device ID |
+| 128 | 64 bytes | MQTT Host |
+| 192 | 64 bytes | MQTT Port (stored as string) |
+| 224 | 64 bytes | MQTT Username |
+| 288 | 64 bytes | MQTT Password |
+
+Total EEPROM size: **512 bytes**.
 
 ---
 
@@ -122,9 +142,15 @@ Read SSID & Password from EEPROM
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/` | GET | Home page – shows AP SSID, password, and IP |
-| `/scan` | GET | Scans for available WiFi networks and shows a selection form |
-| `/connect` | POST | Receives selected SSID and password, attempts connection |
+| `/` | GET | MQTT config panel – shows connection status and config form |
+| `/mqtt` | POST | Save MQTT credentials and attempt connection |
+| `/reset` | POST | Erase all EEPROM data and reboot |
+
+---
+
+## MQTT Client ID
+
+The client ID is derived from the ESP8266 chip ID: `ESP-<chipId>` (e.g. `ESP-1234567`).
 
 ---
 
